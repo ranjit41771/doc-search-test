@@ -706,4 +706,4 @@ This project was built with **Claude (Anthropic)** as an AI coding assistant. Cl
 - Docker Compose and Dockerfile configuration
 - Documentation and production readiness analysis
 
-All architectural decisions, trade-off analysis (CockroachDB as source of truth, multi-tenancy model, CAP theorem trade-offs, blue/green deployment strategy),Architecture diagram, FinOps,  were made by the engineer (Ranjit Singh) with Claude as a collaborative tool.
+All architectural decisions, trade-off analysis (CockroachDB as source of truth, multi-tenancy model, CAP theorem trade-offs, blue/green deployment strategy),Architecture diagram, FinOps,  were made by the engineer (Ranjit Singh).
