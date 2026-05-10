@@ -59,21 +59,11 @@ Thumbs.db
 *.log
 logs/
 
-# ── Generated diagram files (regenerate with python3 arch_diagrams/*.py) ──────
-docs/architecture.png
-docs/aws_architecture.png
-docs/write_path.png
-docs/search_path.png
-aws_architecture.png
 
-# ── Graphviz intermediate files ───────────────────────────────────────────────
-docs/architecture
-docs/aws_architecture
-docs/write_path
-docs/search_path
 
-# ── FinOps Excel (binary — commit PNGs instead) ───────────────────────────────
-FinOps/*.xlsx
+
+
+
 
 # ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/

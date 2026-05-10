@@ -339,8 +339,8 @@ curl "http://localhost:8000/search?q=consensus+algorithm&page=1&size=5" \
 ### Start all services
 
 ```bash
-git clone <repo-url>
-cd document_search
+git clone git@github.com:ranjit41771/doc-search-test.git
+cd doc-search-test
 chmod +x run.sh
 sudo ./run.sh
 ```
