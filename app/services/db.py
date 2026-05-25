@@ -29,6 +29,7 @@ Production note: If migrating to PostgreSQL, replace TenantScope with:
 
 from datetime import datetime, timezone
 import json
+import re
 import uuid
 
 import asyncpg
@@ -143,16 +144,35 @@ class TenantScope:
 
     # ── Injection logic ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _strip_sql_comments(query: str) -> str:
+        """Remove SQL -- line comments and /* */ block comments.
+
+        Used before WHERE-detection so that a trailing comment cannot cause the
+        tenant_id filter to be injected inside/after a comment, which would
+        silently comment it out and bypass tenant isolation.
+        """
+        query = re.sub(r"--[^\n]*", "", query)
+        query = re.sub(r"/\*.*?\*/", " ", query, flags=re.DOTALL)
+        return query
+
     def _inject(self, query: str, args: tuple) -> tuple[str, tuple]:
         """Append AND tenant_id = $N to WHERE clause (or add WHERE if absent).
 
         Works for SELECT, UPDATE, DELETE. For INSERT the tenant_id column is
         always included explicitly — no injection needed (the FK + index enforce it).
+
+        SQL comments are stripped before injection: a trailing -- comment on the
+        original query would otherwise comment out the injected tenant_id filter,
+        bypassing tenant isolation entirely.
         """
-        upper = query.strip().upper()
+        # Strip comments for both detection and the final injected query.
+        # Comment content has no semantic meaning — removing it is safe.
+        clean = self._strip_sql_comments(query).rstrip()
+        upper = clean.upper()
 
         # INSERT: tenant_id is a required column — no injection, just validate
-        if upper.startswith("INSERT"):
+        if upper.lstrip().startswith("INSERT"):
             return query, args
 
         tenant_param_index = len(args) + 1  # next positional param index
@@ -160,10 +180,10 @@ class TenantScope:
 
         if "WHERE" in upper:
             # Append to existing WHERE clause
-            injected = query + f" AND {tenant_filter}"
+            injected = clean + f" AND {tenant_filter}"
         else:
             # No WHERE clause (e.g. SELECT ... FROM documents) — add one
-            injected = query + f" WHERE {tenant_filter}"
+            injected = clean + f" WHERE {tenant_filter}"
 
         return injected, args + (self._tenant_id,)
 

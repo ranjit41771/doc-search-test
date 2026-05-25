@@ -51,3 +51,31 @@ async def check_rate_limit(redis: Redis, tenant_id: str) -> tuple[bool, int]:
         return False, retry_after
 
     return True, 0
+
+
+async def check_auth_rate_limit(redis: Redis, identifier: str) -> tuple[bool, int]:
+    """Stricter rate limit for auth endpoints, keyed by email.
+
+    Uses auth_rate_limit_requests / auth_rate_limit_window_seconds from settings
+    (default: 10 attempts per 60s per email) to prevent brute-force attacks.
+    """
+    now    = time.time()
+    cutoff = now - settings.auth_rate_limit_window_seconds
+    key    = f"auth_rate:{identifier}"
+
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.zremrangebyscore(key, 0, cutoff)
+        pipe.zadd(key, {str(uuid.uuid4()): now})
+        pipe.zcard(key)
+        pipe.expire(key, settings.auth_rate_limit_window_seconds + 1)
+        _, _, count, _ = await pipe.execute()
+
+    if count > settings.auth_rate_limit_requests:
+        earliest = await redis.zrange(key, 0, 0, withscores=True)
+        if earliest:
+            retry_after = int(settings.auth_rate_limit_window_seconds - (now - earliest[0][1])) + 1
+        else:
+            retry_after = settings.auth_rate_limit_window_seconds
+        return False, retry_after
+
+    return True, 0

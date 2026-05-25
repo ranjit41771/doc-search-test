@@ -1,15 +1,27 @@
 import time
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 from app.dependencies import get_db, get_es, get_redis
 from app.models import HealthDependency, HealthResponse
+from app.services.auth import decode_access_token_dep
 
 router = APIRouter(tags=["health"])
 
 
+@router.get("/ping", include_in_schema=False)
+async def ping():
+    """Unauthenticated liveness probe for load balancers / orchestrators."""
+    return {"status": "ok"}
+
+
 @router.get("/health", response_model=HealthResponse)
-async def health():
+async def health(_: dict = Depends(decode_access_token_dep)):
+    """Detailed dependency health check. Requires a valid JWT.
+
+    Exposes internal latency and service topology — restricted to authenticated
+    tenants so this information is not visible to unauthenticated scanners.
+    """
     deps = {}
     overall = "healthy"
 

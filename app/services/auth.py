@@ -9,6 +9,11 @@ from app.config import settings
 
 _bearer_scheme = HTTPBearer()
 
+# Pre-computed hash used when the email is not found during login.
+# Always running bcrypt (against this dummy) prevents timing attacks that
+# would otherwise reveal whether an email address is registered.
+DUMMY_HASH = bcrypt.hashpw(b"dummy-timing-guard", bcrypt.gensalt()).decode()
+
 
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()

@@ -5,7 +5,7 @@ import json
 import logging
 
 import aio_pika
-from elasticsearch import AsyncElasticsearch
+from elasticsearch import AsyncElasticsearch, NotFoundError
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import settings
@@ -36,8 +36,15 @@ async def handle_event(es: AsyncElasticsearch, event: dict) -> None:
         try:
             await es.delete(index=settings.es_index, id=doc_id)
             log.info("Deleted document %s from ES", doc_id)
-        except Exception:
-            pass  # Already removed or never indexed
+        except NotFoundError:
+            # Document was never indexed or already removed — safe to ignore.
+            log.debug("Delete no-op: document %s not found in ES index", doc_id)
+        except Exception as e:
+            # Any other failure (ES down, timeout, etc.) means the document
+            # remains searchable after the tenant deleted it. Re-raise so the
+            # message is requeued and retried rather than silently lost.
+            log.error("Failed to delete document %s from ES: %s", doc_id, e)
+            raise
 
 
 @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=2, max=30))
