@@ -1,0 +1,62 @@
+Distributed Systems: CAP Theorem, Raft Consensus, and Modern Search Infrastructure
+====================================================================================
+
+Introduction to Distributed Systems
+-------------------------------------
+
+Distributed systems are collections of independent computers that appear to users as a single coherent system. These systems face unique challenges around consistency, availability, fault tolerance, and partition tolerance. Understanding these trade-offs is fundamental to building reliable, scalable software.
+
+The CAP Theorem
+---------------
+
+The CAP theorem, formulated by Eric Brewer, states that a distributed data store can only guarantee two of the following three properties simultaneously: Consistency, Availability, and Partition tolerance. In the presence of a network partition, a distributed system must choose between consistency and availability.
+
+Consistency means every read receives the most recent write or an error. Availability means every request receives a response, without guarantee that it contains the most recent write. Partition tolerance means the system continues operating despite network partitions.
+
+Real-world systems like Apache Cassandra prioritize availability and partition tolerance (AP), while systems like HBase prioritize consistency and partition tolerance (CP). Understanding CAP theorem trade-offs helps architects make informed decisions about database and storage system selection.
+
+Raft Consensus Algorithm
+------------------------
+
+Raft consensus is a distributed consensus algorithm designed to be more understandable than Paxos. Developed by Diego Ongaro and John Ousterhout, Raft manages replicated logs across a cluster of servers to achieve fault tolerance and strong consistency.
+
+Raft operates through leader election and log replication. Each node can be in one of three states: leader, follower, or candidate. The leader receives all client requests and replicates log entries to followers. If the leader fails, a new election occurs and a follower becomes the new leader.
+
+Systems like etcd, CockroachDB, TiKV, and Consul rely on Raft consensus for their distributed coordination. CockroachDB uses Raft consensus to replicate data ranges across nodes, ensuring that even if nodes fail, the data remains consistent and available.
+
+Fault Tolerance in Distributed Systems
+---------------------------------------
+
+Fault tolerance is the ability of a system to continue operating correctly in the presence of failures. This includes hardware failures, network partitions, software bugs, and Byzantine faults. Distributed systems achieve fault tolerance through redundancy, replication, and careful protocol design.
+
+The Raft consensus algorithm provides fault tolerance by requiring a quorum (majority) of nodes to agree before committing a log entry. With 2f+1 nodes, the system can tolerate f failures. This means a 5-node cluster can tolerate 2 simultaneous node failures while continuing to serve requests.
+
+Elasticsearch and Full-Text Search
+------------------------------------
+
+Elasticsearch is a distributed search and analytics engine built on Apache Lucene. It uses an inverted index data structure to enable fast full-text search. The inverted index maps terms to the documents that contain them, allowing Elasticsearch to quickly find all documents matching a query.
+
+Full-text search in Elasticsearch involves tokenization, stemming, and relevance scoring. Documents are broken into tokens, normalized using analyzers, and stored in the inverted index. When a search query arrives, Elasticsearch uses the BM25 algorithm to score documents by relevance, returning results ranked by their relevance score.
+
+Elasticsearch clusters consist of nodes with different roles: master nodes manage cluster state, data nodes store and index documents, and coordinating nodes route requests. Sharding distributes data across nodes, and replicas provide fault tolerance and improved read throughput. Sub-50ms search latency is achievable even across billions of documents with proper index design.
+
+Redis Caching Strategies
+-------------------------
+
+Redis is an in-memory data structure store used as a cache, message broker, and database. Redis caching dramatically reduces database load and improves application response times. Common Redis caching strategies include cache-aside, write-through, and write-behind.
+
+Redis sorted sets implement sliding window rate limits by storing request timestamps with scores. The ZADD, ZREMRANGEBYSCORE, and ZCARD commands work together to count requests within a time window, providing accurate rate limiting with millisecond precision. Redis also supports TTL-based cache expiration, ensuring stale data is automatically removed.
+
+Redis Pub/Sub and Redis Streams enable real-time event streaming for distributed systems. Message queues backed by Redis allow services to decouple and communicate asynchronously, improving overall system resilience and scalability.
+
+Document Extraction Pipeline
+-----------------------------
+
+Modern document search systems require an extraction pipeline to process uploaded files. PDF documents, DOCX files, and plain text documents must be parsed and their text extracted before they can be indexed in Elasticsearch. The extraction pipeline typically involves these steps: file upload to object storage (S3 or compatible), queueing an extraction job in a message broker (RabbitMQ or SQS), running the extraction worker, and indexing the extracted text chunks into Elasticsearch.
+
+The extraction pipeline achieves fault tolerance by persisting job state in the database. Documents begin in a "queued" state, transition to "extracting" during processing, and reach "indexed" when complete. If extraction fails, the document enters a "failed" state with an error message for debugging.
+
+Conclusion
+----------
+
+Building distributed systems that are both highly available and strongly consistent requires careful trade-off analysis. The CAP theorem provides a framework for understanding fundamental limitations. Raft consensus enables fault-tolerant coordination. Elasticsearch inverted index provides sub-millisecond full-text search. Redis caching reduces database load. Together, these technologies form the backbone of modern distributed document search infrastructure.

@@ -1,7 +1,7 @@
 import json
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
@@ -90,3 +90,53 @@ class HealthDependency(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     dependencies: dict[str, HealthDependency]
+
+
+# ── File document models ───────────────────────────────────────────────────────
+
+class DocumentUploadResponse(BaseModel):
+    """Returned immediately after POST /documents (file upload)."""
+    doc_id: str
+    status: str = "queued"
+    file_name: str
+    file_size_bytes: int
+
+
+class DocumentDetailResponse(BaseModel):
+    """Full document metadata — returned by GET /documents/{id}."""
+    id: str
+    tenant_id: str
+    file_name: Optional[str] = None
+    mime_type: Optional[str] = None
+    s3_key: Optional[str] = None
+    file_size_bytes: int = 0
+    extraction_status: str = "queued"
+    extraction_error: Optional[str] = None
+    page_count: Optional[int] = None
+    word_count: Optional[int] = None
+    title: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+    download_url: Optional[str] = None  # presigned S3 URL, populated on read
+
+
+class FileSearchResultItem(BaseModel):
+    """One result from GET /search (one document, best matching chunk)."""
+    doc_id: str
+    file_name: str
+    snippet: str
+    page_hint: int
+    score: float
+    download_url: str
+    extraction_status: str
+
+
+class FileSearchResponse(BaseModel):
+    """Response from GET /search."""
+    results: list[FileSearchResultItem]
+    total: int
+    query_time_ms: int
+    query: str
+    tenant_id: str
+    cached: bool = False

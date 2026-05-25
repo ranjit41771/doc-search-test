@@ -3,8 +3,6 @@ version: "3.9"
 services:
   api:
     build: .
-    # 4 workers: each is a separate OS process with its own event loop.
-    # --reload is removed — it watches the filesystem and adds latency overhead.
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
     ports:
       - "8000:8000"
@@ -13,6 +11,15 @@ services:
       REDIS_URL: redis://redis:6379
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       DATABASE_URL: postgresql://root@cockroachdb:26257/defaultdb?sslmode=disable
+      S3_ENDPOINT_URL: http://localstack:4566
+      S3_BUCKET: document-search
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+      MAX_FILE_SIZE_MB: "50"
+      CHUNK_SIZE: "500"
+      CHUNK_OVERLAP: "100"
+      PRESIGNED_URL_EXPIRY: "3600"
     depends_on:
       elasticsearch:
         condition: service_healthy
@@ -20,11 +27,13 @@ services:
         condition: service_healthy
       cockroachdb:
         condition: service_healthy
+      localstack:
+        condition: service_healthy
     volumes:
       - ./app:/app/app
     restart: unless-stopped
 
-  # Index worker: consumes from RabbitMQ, writes to Elasticsearch
+  # Index + extraction worker: consumes from RabbitMQ, writes to ES, reads/writes S3
   index-worker:
     build: .
     command: ["python", "-m", "app.worker"]
@@ -33,6 +42,15 @@ services:
       REDIS_URL: redis://redis:6379
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       DATABASE_URL: postgresql://root@cockroachdb:26257/defaultdb?sslmode=disable
+      S3_ENDPOINT_URL: http://localstack:4566
+      S3_BUCKET: document-search
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+      MAX_FILE_SIZE_MB: "50"
+      CHUNK_SIZE: "500"
+      CHUNK_OVERLAP: "100"
+      PRESIGNED_URL_EXPIRY: "3600"
     depends_on:
       elasticsearch:
         condition: service_healthy
@@ -40,14 +58,34 @@ services:
         condition: service_healthy
       cockroachdb:
         condition: service_healthy
+      localstack:
+        condition: service_healthy
     restart: unless-stopped
+
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3
+      - DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init-s3.sh
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal s3 ls || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   cockroachdb:
     image: cockroachdb/cockroach:v23.2.4
     command: start-single-node --insecure
     ports:
       - "26257:26257"
-      - "8080:8080"  # CockroachDB admin UI
+      - "8080:8080"
     volumes:
       - crdb_data:/cockroach/cockroach-data
     healthcheck:
@@ -98,7 +136,20 @@ services:
       timeout: 5s
       retries: 10
 
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - api
+    restart: unless-stopped
+
 volumes:
   crdb_data:
   es_data:
   redis_data:
+  localstack_data:

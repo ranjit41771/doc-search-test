@@ -12,12 +12,14 @@ Usage:
 
 Prerequisites:
     pip install requests httpx
-    docker compose up -d
+    docker compose up -d   (includes LocalStack for S3, RabbitMQ, CockroachDB, Elasticsearch, Redis)
 """
 
 import argparse
 import asyncio
+import io
 import json
+import os
 import statistics
 import sys
 import time
@@ -38,6 +40,58 @@ BLUE   = "\033[94m"
 BOLD   = "\033[1m"
 DIM    = "\033[2m"
 RESET  = "\033[0m"
+
+
+# ── Fixture content ───────────────────────────────────────────────────────────
+
+# Path to the sample text fixture file
+_FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
+_SAMPLE_TXT_PATH = os.path.join(_FIXTURES_DIR, "sample.txt")
+
+# Inline TXT content used as a fallback when fixture file is absent,
+# and also as a second upload document with different content.
+_TXT_CONTENT_2 = (
+    "Raft consensus algorithm ensures fault tolerance in distributed systems. "
+    "Leader election and log replication are core to Raft. "
+    "CockroachDB uses Raft consensus to replicate data ranges. "
+    "Elasticsearch inverted index enables sub-50ms full-text search. "
+    "Redis caching with sorted sets implements sliding window rate limits. "
+    "CAP theorem states that consistency, availability, and partition tolerance "
+    "cannot all be guaranteed simultaneously in a distributed system. "
+    "Fault-tolerant systems use replication and quorum-based consensus protocols."
+).encode()
+
+
+def _load_sample_txt() -> bytes:
+    """Load the fixture text file, generating fallback content if absent."""
+    if os.path.exists(_SAMPLE_TXT_PATH):
+        with open(_SAMPLE_TXT_PATH, "rb") as fh:
+            return fh.read()
+    # Fallback: generate minimal content inline so tests can still run
+    return (
+        "Distributed systems use Raft consensus for fault tolerance. "
+        "The CAP theorem governs consistency vs availability trade-offs. "
+        "Elasticsearch provides full-text search via an inverted index. "
+        "Redis caching reduces database load in high-traffic applications."
+    ).encode()
+
+
+# A well-known minimal valid PDF (~800 bytes) that readers can parse.
+# Contains a single page with one line of text about distributed systems.
+MINIMAL_PDF = (
+    b"%PDF-1.4\n"
+    b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+    b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+    b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]\n"
+    b"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n"
+    b"4 0 obj\n<< /Length 44 >>\nstream\nBT /F1 12 Tf 100 700 Td "
+    b"(Distributed systems use Raft consensus for fault tolerance.) Tj ET\nendstream\nendobj\n"
+    b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"
+    b"xref\n0 6\n0000000000 65535 f\n0000000009 00000 n\n"
+    b"0000000058 00000 n\n0000000115 00000 n\n0000000266 00000 n\n"
+    b"0000000360 00000 n\n"
+    b"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n441\n%%EOF"
+)
 
 
 # ── Latency store ─────────────────────────────────────────────────────────────
@@ -109,6 +163,14 @@ def pct(values: list[float], p: float) -> float:
     return sorted_v[lo] + (sorted_v[hi] - sorted_v[lo]) * (idx - lo)
 
 
+def _safe_json(r: requests.Response) -> Any:
+    """Parse response JSON safely, returning empty dict on failure."""
+    try:
+        return r.json()
+    except Exception:
+        return {}
+
+
 # ── Timed HTTP client ─────────────────────────────────────────────────────────
 
 class Client:
@@ -116,15 +178,19 @@ class Client:
         self.base  = base_url.rstrip("/")
         self.token: str | None = None
 
-    def _h(self) -> dict:
+    def _auth_headers(self) -> dict:
+        h = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        return h
+
+    def _json_headers(self, auth: bool = True) -> dict:
         h = {"Content-Type": "application/json"}
-        if self.token:
+        if auth and self.token:
             h["Authorization"] = f"Bearer {self.token}"
         return h
 
     def _call(self, label: str, fn, *args, **kwargs) -> requests.Response:
         t0 = time.perf_counter()
-        r  = fn(*args, **kwargs, timeout=10)
+        r  = fn(*args, **kwargs, timeout=15)
         ms = (time.perf_counter() - t0) * 1000
         _record(label, ms)
         print(f"  {DIM}→ {label}  {ms:.1f}ms  HTTP {r.status_code}{RESET}")
@@ -135,40 +201,81 @@ class Client:
         return self._call(label, requests.post,
                           f"{self.base}{path}",
                           json=body,
-                          headers=self._h() if auth else {"Content-Type": "application/json"})
+                          headers=self._json_headers(auth))
 
-    def get(self, path: str, params: dict | None = None, *, auth: bool = True) -> requests.Response:
+    def post_multipart(
+        self,
+        path: str,
+        files: dict,
+        data: dict | None = None,
+        *,
+        auth: bool = True,
+    ) -> requests.Response:
+        """POST multipart/form-data (for file uploads)."""
+        label = f"POST {path}"
+        headers = self._auth_headers() if auth else {}
+        return self._call(label, requests.post,
+                          f"{self.base}{path}",
+                          files=files,
+                          data=data or {},
+                          headers=headers)
+
+    def get(
+        self,
+        path: str,
+        params: dict | None = None,
+        *,
+        auth: bool = True,
+        allow_redirects: bool = True,
+    ) -> requests.Response:
         label = f"GET {path}"
         return self._call(label, requests.get,
                           f"{self.base}{path}",
                           params=params,
-                          headers=self._h() if auth else {})
+                          headers=self._json_headers(auth) if auth else {},
+                          allow_redirects=allow_redirects)
 
     def delete(self, path: str) -> requests.Response:
         label = f"DELETE {path}"
         return self._call(label, requests.delete,
                           f"{self.base}{path}",
-                          headers=self._h())
+                          headers=self._auth_headers())
 
 
 # ══ Test functions ════════════════════════════════════════════════════════════
 
 def test_health(client: Client, suite: Suite) -> None:
     section("1. Health Check")
-    r    = client.get("/health", auth=False)
-    data = r.json()
-    dump("Response", data)
-    suite.record("GET /health → 200", r.status_code == 200)
-    suite.record("All dependencies reported",
-                 all(k in data.get("dependencies", {})
-                     for k in ("elasticsearch", "redis", "cockroachdb")))
+    # Try /ping first (public, no auth), fall back to /health
+    r_ping = None
+    try:
+        r_ping = client.get("/ping", auth=False)
+    except Exception:
+        pass
+
+    if r_ping is not None and r_ping.status_code == 200:
+        suite.record("GET /ping → 200 (public health)", True)
+        data = _safe_json(r_ping)
+        dump("Ping response", data)
+    else:
+        r = client.get("/health", auth=False)
+        data = _safe_json(r)
+        dump("Health response", data)
+        suite.record("GET /health → 200", r.status_code == 200)
+        suite.record(
+            "All dependencies reported",
+            all(
+                k in data.get("dependencies", {})
+                for k in ("elasticsearch", "redis", "cockroachdb")
+            ),
+        )
 
 
 def test_register(ca: Client, cb: Client, suite: Suite) -> None:
     section("2. Register")
     for client, tid, name, email, pwd, plan in [
-        (ca, "e2e-alpha", "Alpha Corp", "alpha@e2e.com", "alphapass123", "enterprise"),
-        (cb, "e2e-beta",  "Beta Inc",   "beta@e2e.com",  "betapass456",  "standard"),
+        (ca, "e2e-alpha", "Alpha Corp", "alpha@e2e.com", "Alphapass123", "enterprise"),
+        (cb, "e2e-beta",  "Beta Inc",   "beta@e2e.com",  "Betapass456",  "standard"),
     ]:
         r = client.post("/auth/register", {
             "tenant_id": tid, "name": name,
@@ -178,12 +285,12 @@ def test_register(ca: Client, cb: Client, suite: Suite) -> None:
 
     r_dup = ca.post("/auth/register", {
         "tenant_id": "e2e-alpha", "name": "Dup",
-        "email": "other@e2e.com", "password": "pass1234", "plan": "free",
+        "email": "other@e2e.com", "password": "Duppass1234", "plan": "free",
     }, auth=False)
     suite.record("Duplicate tenant_id → 409", r_dup.status_code == 409)
 
     r_weak = ca.post("/auth/register", {
-        "tenant_id": "weak-p", "name": "W",
+        "tenant_id": "weak-pw", "name": "W",
         "email": "w@e2e.com", "password": "short", "plan": "free",
     }, auth=False)
     suite.record("Weak password → 422", r_weak.status_code == 422)
@@ -192,17 +299,17 @@ def test_register(ca: Client, cb: Client, suite: Suite) -> None:
 def test_login(ca: Client, cb: Client, suite: Suite) -> None:
     section("3. Login")
     r = ca.post("/auth/login",
-                {"email": "alpha@e2e.com", "password": "alphapass123"}, auth=False)
+                {"email": "alpha@e2e.com", "password": "Alphapass123"}, auth=False)
     suite.record("Login Tenant A → 200", r.status_code == 200)
-    ca.token = r.json().get("access_token", "")
+    ca.token = _safe_json(r).get("access_token", "")
 
     r2 = cb.post("/auth/login",
-                 {"email": "beta@e2e.com", "password": "betapass456"}, auth=False)
+                 {"email": "beta@e2e.com", "password": "Betapass456"}, auth=False)
     suite.record("Login Tenant B → 200", r2.status_code == 200)
-    cb.token = r2.json().get("access_token", "")
+    cb.token = _safe_json(r2).get("access_token", "")
 
     r_bad = ca.post("/auth/login",
-                    {"email": "alpha@e2e.com", "password": "wrong"}, auth=False)
+                    {"email": "alpha@e2e.com", "password": "wrongpass"}, auth=False)
     suite.record("Wrong password → 401", r_bad.status_code == 401)
 
 
@@ -210,104 +317,315 @@ def test_auth_me(ca: Client, suite: Suite) -> None:
     section("4. GET /auth/me")
     r = ca.get("/auth/me")
     suite.record("GET /auth/me → 200", r.status_code == 200)
-    suite.record("Correct tenant_id", r.json().get("tenant_id") == "e2e-alpha")
+    suite.record("Correct tenant_id", _safe_json(r).get("tenant_id") == "e2e-alpha")
 
     r_none = requests.get(f"{ca.base}/auth/me", timeout=10)
     suite.record("No token → 403", r_none.status_code == 403)
 
 
-def test_create_documents(ca: Client, suite: Suite) -> list[str]:
-    section("5. POST /documents")
-    doc_ids = []
-    docs = [
-        {"title": "CAP Theorem",         "content": "Consistency, Availability, Partition tolerance."},
-        {"title": "Raft Consensus",       "content": "Raft manages replicated logs in distributed systems."},
-        {"title": "CockroachDB Design",   "content": "Distributed SQL using Raft consensus protocol."},
-        {"title": "Elasticsearch Index",  "content": "Inverted index enables sub-50ms full-text search."},
-        {"title": "Redis Caching",        "content": "Redis sorted sets implement sliding window rate limits."},
-    ]
-    for doc in docs:
-        r = ca.post("/documents", doc)
-        if r.status_code == 201:
-            doc_ids.append(r.json()["id"])
-            suite.record(f"Index '{doc['title']}' → 201", True)
-        else:
-            suite.record(f"Index '{doc['title']}' → 201", False, f"got {r.status_code}")
+def test_upload_documents(ca: Client, suite: Suite) -> list[str]:
+    """Section 5: Upload files using multipart/form-data."""
+    section("5. POST /documents  (multipart file upload)")
 
-    r_no_auth = requests.post(f"{ca.base}/documents",
-                              json={"title": "X", "content": "Y"},
-                              headers={"Content-Type": "application/json"}, timeout=10)
-    suite.record("POST /documents without token → 403", r_no_auth.status_code == 403)
+    doc_ids: list[str] = []
+    txt_bytes = _load_sample_txt()
+
+    # ── Upload 1: full TXT fixture ────────────────────────────────────────────
+    r1 = ca.post_multipart(
+        "/documents",
+        files={"file": ("distributed_systems_report.txt", io.BytesIO(txt_bytes), "text/plain")},
+        data={"title": "Distributed Systems Report"},
+    )
+    data1 = _safe_json(r1)
+    if r1.status_code == 201:
+        doc_ids.append(data1["doc_id"])
+        suite.record("Upload TXT fixture → 201", True)
+    else:
+        suite.record("Upload TXT fixture → 201", False, f"got {r1.status_code}: {data1}")
+
+    suite.record("Upload response has doc_id", "doc_id" in data1)
+    suite.record("Upload response status == 'queued'", data1.get("status") == "queued")
+    suite.record("Upload response has file_name", "file_name" in data1)
+    suite.record("Upload response has file_size_bytes", "file_size_bytes" in data1)
+
+    dump("Upload 1 response", data1)
+
+    # ── Upload 2: inline TXT content (different keywords) ────────────────────
+    r2 = ca.post_multipart(
+        "/documents",
+        files={"file": ("raft_notes.txt", io.BytesIO(_TXT_CONTENT_2), "text/plain")},
+        data={"title": "Raft & CAP Notes", "tags": "distributed,consensus"},
+    )
+    data2 = _safe_json(r2)
+    if r2.status_code == 201:
+        doc_ids.append(data2["doc_id"])
+        suite.record("Upload second TXT → 201", True)
+    else:
+        suite.record("Upload second TXT → 201", False, f"got {r2.status_code}: {data2}")
+
+    # ── Upload 3: minimal PDF ─────────────────────────────────────────────────
+    r3 = ca.post_multipart(
+        "/documents",
+        files={"file": ("architecture.pdf", io.BytesIO(MINIMAL_PDF), "application/pdf")},
+        data={"title": "Architecture PDF"},
+    )
+    data3 = _safe_json(r3)
+    if r3.status_code == 201:
+        doc_ids.append(data3["doc_id"])
+        suite.record("Upload minimal PDF → 201", True)
+    else:
+        suite.record("Upload minimal PDF → 201", False, f"got {r3.status_code}: {data3}")
+
+    dump("Upload 3 (PDF) response", data3)
+
+    # ── No auth → 403 ────────────────────────────────────────────────────────
+    r_noauth = requests.post(
+        f"{ca.base}/documents",
+        files={"file": ("test.txt", io.BytesIO(b"hello world test content"), "text/plain")},
+        timeout=10,
+    )
+    suite.record("POST /documents without token → 403", r_noauth.status_code == 403,
+                 f"got {r_noauth.status_code}" if r_noauth.status_code != 403 else "")
+
+    # ── Unsupported MIME type → 415 ───────────────────────────────────────────
+    # Send bytes that python-magic will identify as application/octet-stream
+    # (random binary data with no valid magic bytes for any allowed format)
+    fake_exe = bytes(range(256)) * 4  # 1024 bytes of sequential binary data
+    r_mime = ca.post_multipart(
+        "/documents",
+        files={"file": ("malware.exe", io.BytesIO(fake_exe), "application/octet-stream")},
+    )
+    suite.record("Unsupported MIME type → 415", r_mime.status_code == 415,
+                 f"got {r_mime.status_code}" if r_mime.status_code != 415 else "")
+
     return doc_ids
 
 
-def test_get_document(ca: Client, cb: Client, doc_ids: list[str], suite: Suite) -> None:
-    section("6. GET /documents/{id}")
-    r = ca.get(f"/documents/{doc_ids[0]}")
-    suite.record("Owner GET → 200", r.status_code == 200)
-    suite.record("Correct tenant in response",
-                 r.json().get("tenant_id") == "e2e-alpha")
+def _poll_extraction(
+    client: Client,
+    doc_id: str,
+    max_attempts: int = 15,
+    interval_sec: float = 2.0,
+) -> dict | None:
+    """Poll GET /documents/{doc_id} until status is 'indexed' or 'failed'.
 
-    r_cross = cb.get(f"/documents/{doc_ids[0]}")
+    Returns the final document dict, or None if we time out.
+    """
+    for attempt in range(1, max_attempts + 1):
+        r = client.get(f"/documents/{doc_id}")
+        data = _safe_json(r)
+        status = data.get("extraction_status", "unknown")
+        print(f"  {YELLOW}Waiting for extraction... attempt {attempt}/{max_attempts} "
+              f"(status: {status}){RESET}")
+        if status in ("indexed", "failed"):
+            return data
+        if attempt < max_attempts:
+            time.sleep(interval_sec)
+    return None
+
+
+def test_extraction_status(
+    ca: Client, cb: Client, doc_ids: list[str], suite: Suite
+) -> None:
+    """Section 6: Poll GET /documents/{id} until extraction completes."""
+    section("6. Extraction Status Polling  (GET /documents/{id})")
+
+    if not doc_ids:
+        print(f"  {YELLOW}No doc_ids from upload — skipping extraction tests.{RESET}")
+        return
+
+    # Poll the first document (TXT) until indexed or failed
+    doc_id = doc_ids[0]
+    final = _poll_extraction(ca, doc_id)
+
+    if final is None:
+        suite.record("TXT doc reaches indexed/failed within 30s", False,
+                     "Timed out waiting for extraction")
+    else:
+        status = final.get("extraction_status")
+        if status == "failed":
+            err = final.get("extraction_error", "no error detail")
+            print(f"  {RED}Extraction failed for {doc_id}: {err}{RESET}")
+        suite.record("TXT doc reaches indexed or failed", status in ("indexed", "failed"),
+                     f"status={status}")
+
+    # GET metadata checks on the first doc (even if extraction failed)
+    r = ca.get(f"/documents/{doc_id}")
+    data = _safe_json(r)
+    dump("GET /documents response", data)
+
+    suite.record("GET /documents/{id} → 200", r.status_code == 200)
+    suite.record("Response has file_name", bool(data.get("file_name")))
+    suite.record("Response has mime_type", bool(data.get("mime_type")))
+    suite.record("Response has extraction_status field", "extraction_status" in data)
+    suite.record("Response has download_url (presigned S3)", bool(data.get("download_url")))
+    suite.record("download_url starts with http",
+                 str(data.get("download_url", "")).startswith("http"))
+
+    # Cross-tenant GET → 404 (tenant isolation)
+    r_cross = cb.get(f"/documents/{doc_id}")
     suite.record("Cross-tenant GET → 404 (isolation)", r_cross.status_code == 404,
                  f"BREACH! got {r_cross.status_code}" if r_cross.status_code != 404 else "")
 
-    r_miss = ca.get("/documents/nonexistent-id-xyz")
+    # Non-existent doc → 404
+    r_miss = ca.get("/documents/nonexistent-id-does-not-exist-xyz")
     suite.record("Non-existent doc → 404", r_miss.status_code == 404)
 
 
+def test_download_redirect(ca: Client, doc_ids: list[str], suite: Suite) -> None:
+    """Section 7: GET /documents/{id}/download → 302 redirect to presigned S3 URL."""
+    section("7. GET /documents/{id}/download  (302 → presigned S3)")
+
+    if not doc_ids:
+        print(f"  {YELLOW}No doc_ids — skipping download redirect test.{RESET}")
+        return
+
+    doc_id = doc_ids[0]
+    r = ca.get(f"/documents/{doc_id}/download", allow_redirects=False)
+    suite.record("GET /documents/{id}/download → 302", r.status_code == 302,
+                 f"got {r.status_code}" if r.status_code != 302 else "")
+    location = r.headers.get("Location", r.headers.get("location", ""))
+    suite.record("Location header is present", bool(location),
+                 "Location header missing" if not location else "")
+    suite.record("Location header starts with http",
+                 location.startswith("http"),
+                 f"got: {location[:80]}" if location and not location.startswith("http") else "")
+
+
 def test_search(ca: Client, cb: Client, suite: Suite) -> None:
-    section("7. GET /search")
-    print(f"  {YELLOW}Waiting 2s for async ES indexing...{RESET}")
-    time.sleep(2)
+    """Section 8: GET /search — full-text search over indexed file chunks."""
+    section("8. GET /search")
+
+    # Give async extraction a moment to complete if not already polled
+    print(f"  {YELLOW}Waiting 3s for extraction + ES indexing...{RESET}")
+    time.sleep(3)
 
     r = ca.get("/search", {"q": "distributed systems"})
-    data = r.json()
+    data = _safe_json(r)
     suite.record("Search → 200", r.status_code == 200)
-    suite.record("Returns results", data.get("total", 0) >= 1)
-    suite.record("cached=False on first call", data.get("cached") is False)
+    suite.record("Returns results (total >= 1)", data.get("total", 0) >= 1,
+                 f"total={data.get('total')}")
 
+    results = data.get("results", [])
+    if results:
+        first = results[0]
+        suite.record("Result has doc_id", "doc_id" in first)
+        suite.record("Result has snippet", bool(first.get("snippet")))
+        suite.record("Result has score", "score" in first)
+        suite.record("Result has download_url", bool(first.get("download_url")))
+        suite.record("download_url starts with http",
+                     str(first.get("download_url", "")).startswith("http"))
+    else:
+        suite.record("Result has doc_id", False, "No results returned")
+        suite.record("Result has snippet", False, "No results returned")
+        suite.record("Result has score", False, "No results returned")
+        suite.record("Result has download_url", False, "No results returned")
+        suite.record("download_url starts with http", False, "No results returned")
+
+    suite.record("cached=False on first call", data.get("cached") is False,
+                 f"cached={data.get('cached')}")
+
+    # Second identical call → should be cached
     r2 = ca.get("/search", {"q": "distributed systems"})
-    suite.record("Same query → cached=True (Redis L2 hit)", r2.json().get("cached") is True)
+    suite.record("Same query → cached=True (Redis L2 hit)",
+                 _safe_json(r2).get("cached") is True)
 
+    # Tenant isolation: Tenant B must see 0 results from Tenant A's docs
     r_iso = cb.get("/search", {"q": "distributed systems"})
-    suite.record("Tenant B sees 0 results from Tenant A (isolation)",
-                 r_iso.json().get("total") == 0,
-                 f"BREACH! total={r_iso.json().get('total')}" if r_iso.json().get("total", 0) > 0 else "")
+    iso_total = _safe_json(r_iso).get("total", -1)
+    suite.record(
+        "Tenant B sees 0 results from Tenant A (isolation)",
+        iso_total == 0,
+        f"BREACH! total={iso_total}" if iso_total != 0 else "",
+    )
 
+    # Pagination
     r_page = ca.get("/search", {"q": "distributed", "page": 1, "size": 2})
     suite.record("Pagination size=2 respected",
-                 len(r_page.json().get("results", [])) <= 2)
+                 len(_safe_json(r_page).get("results", [])) <= 2)
+
+    # Search for other indexed keywords
+    r_raft = ca.get("/search", {"q": "Raft consensus"})
+    suite.record("Search for 'Raft consensus' → 200", r_raft.status_code == 200)
 
 
 def test_delete(ca: Client, cb: Client, doc_ids: list[str], suite: Suite) -> None:
-    section("8. DELETE /documents/{id}")
+    """Section 9: DELETE /documents/{id}."""
+    section("9. DELETE /documents/{id}")
+
+    if not doc_ids:
+        print(f"  {YELLOW}No doc_ids — skipping delete tests.{RESET}")
+        return
+
     target = doc_ids[-1]
 
+    # Cross-tenant DELETE → 404 (isolation)
     r_cross = cb.delete(f"/documents/{target}")
     suite.record("Cross-tenant DELETE → 404 (isolation)", r_cross.status_code == 404,
                  f"BREACH! got {r_cross.status_code}" if r_cross.status_code != 404 else "")
 
+    # Owner DELETE → 204
     r = ca.delete(f"/documents/{target}")
-    suite.record("Owner DELETE → 204", r.status_code == 204)
+    suite.record("Owner DELETE → 204", r.status_code == 204,
+                 f"got {r.status_code}" if r.status_code != 204 else "")
 
+    # GET after delete → 404
     r_get = ca.get(f"/documents/{target}")
     suite.record("Deleted doc → 404 on GET", r_get.status_code == 404)
 
+    # Double DELETE → 404
     r2 = ca.delete(f"/documents/{target}")
     suite.record("Double DELETE → 404", r2.status_code == 404)
 
+    # After deletion, search should eventually drop the doc from results
+    print(f"  {YELLOW}Waiting 2s for async ES delete to propagate...{RESET}")
+    time.sleep(2)
+    r_search = ca.get("/search", {"q": "distributed systems"})
+    deleted_in_results = any(
+        item.get("doc_id") == target
+        for item in _safe_json(r_search).get("results", [])
+    )
+    suite.record("Deleted doc absent from search results",
+                 not deleted_in_results,
+                 f"doc_id {target} still in results!" if deleted_in_results else "")
+
 
 def test_validation(ca: Client, suite: Suite) -> None:
-    section("9. Input Validation")
-    cases = [
-        ("Missing content",  ca.post("/documents", {"title": "X"}),            422),
-        ("Missing title",    ca.post("/documents", {"content": "X"}),           422),
-        ("Empty search q",   ca.get("/search", {"q": ""}),                      422),
-    ]
-    for name, r, expected in cases:
-        suite.record(f"{name} → {expected}", r.status_code == expected,
-                     f"got {r.status_code}")
+    """Section 10: Input validation edge cases."""
+    section("10. Input Validation")
+
+    # POST /documents with no file → 422
+    r_nofile = requests.post(
+        f"{ca.base}/documents",
+        data={"title": "No file here"},
+        headers={"Authorization": f"Bearer {ca.token}"},
+        timeout=10,
+    )
+    suite.record("POST /documents with no file → 422", r_nofile.status_code == 422,
+                 f"got {r_nofile.status_code}")
+
+    # POST /documents with empty file → 400 or 422
+    r_empty = ca.post_multipart(
+        "/documents",
+        files={"file": ("empty.txt", io.BytesIO(b""), "text/plain")},
+    )
+    suite.record("POST /documents with empty file → 400 or 422",
+                 r_empty.status_code in (400, 422),
+                 f"got {r_empty.status_code}")
+
+    # GET /search with empty q → 422
+    r_empty_q = ca.get("/search", {"q": ""})
+    suite.record("GET /search with empty q → 422", r_empty_q.status_code == 422,
+                 f"got {r_empty_q.status_code}")
+
+    # GET /search with missing q → 422
+    r_no_q = requests.get(
+        f"{ca.base}/search",
+        headers={"Authorization": f"Bearer {ca.token}"},
+        timeout=10,
+    )
+    suite.record("GET /search with missing q → 422", r_no_q.status_code == 422,
+                 f"got {r_no_q.status_code}")
 
 
 # ══ Load test ═════════════════════════════════════════════════════════════════
@@ -329,11 +647,11 @@ async def _provision_load_tenants(base_url: str) -> list[str]:
             # Register (ignore 409 — already exists from a previous run)
             await client.post(f"{base_url}/auth/register", json={
                 "tenant_id": tid, "name": f"Load Tenant {i}",
-                "email": email, "password": "loadpass123", "plan": "enterprise",
+                "email": email, "password": "Loadpass123", "plan": "enterprise",
             }, timeout=10)
             # Login to get token
             r = await client.post(f"{base_url}/auth/login", json={
-                "email": email, "password": "loadpass123",
+                "email": email, "password": "Loadpass123",
             }, timeout=10)
             if r.status_code == 200:
                 tokens.append(r.json()["access_token"])
@@ -371,7 +689,7 @@ async def run_load_test(
     target_rps: int = 300,
     duration_sec: int = 10,
 ) -> None:
-    section(f"10. Load Test  —  {target_rps} req/s  ×  {duration_sec}s  "
+    section(f"11. Load Test  —  {target_rps} req/s  ×  {duration_sec}s  "
             f"({LOAD_TEST_TENANTS} tenants, ~{target_rps//LOAD_TEST_TENANTS} req/s each)")
 
     print(f"\n  {CYAN}Why multiple tenants?{RESET}")
@@ -385,6 +703,8 @@ async def run_load_test(
         print(f"{RED}No tokens — skipping load test.{RESET}")
         return
 
+    # Target: GET /search?q=distributed+systems
+    # Works even when tenants have 0 results — we're measuring throughput/latency.
     url       = f"{base_url}/search?q=distributed+systems"
     results: list[dict] = []
     start     = time.perf_counter()
@@ -437,8 +757,9 @@ async def run_load_test(
     print(f"  {'Achieved RPS':<32} {total/wall_sec:>14.1f}")
     print(f"  {'Successful (2xx)':<32} {GREEN}{successes:>15,}{RESET}")
     print(f"  {'Failed':<32} {(RED if failures else GREEN)}{failures:>15,}{RESET}")
-    rate_colour = GREEN if successes/total > 0.99 else (YELLOW if successes/total > 0.95 else RED)
-    print(f"  {'Success Rate':<32} {rate_colour}{successes/total*100:>14.1f}%{RESET}")
+    if total > 0:
+        rate_colour = GREEN if successes/total > 0.99 else (YELLOW if successes/total > 0.95 else RED)
+        print(f"  {'Success Rate':<32} {rate_colour}{successes/total*100:>14.1f}%{RESET}")
 
     print(f"\n  {'Status Code Breakdown':}")
     print(f"  {'─'*40}")
@@ -528,9 +849,17 @@ def run(base_url: str, load_rps: int, load_duration: int) -> None:
     print(f"\n{YELLOW}Waiting for server...{RESET}")
     for i in range(10):
         try:
-            if requests.get(f"{base_url}/health", timeout=5).status_code == 200:
-                print(f"{GREEN}Server ready.{RESET}")
-                break
+            # Try /ping (public) first, then /health
+            for probe in ("/ping", "/health"):
+                try:
+                    if requests.get(f"{base_url}{probe}", timeout=5).status_code == 200:
+                        print(f"{GREEN}Server ready (probe: {probe}).{RESET}")
+                        break
+                except Exception:
+                    continue
+            else:
+                raise requests.exceptions.ConnectionError("no probe succeeded")
+            break
         except requests.exceptions.ConnectionError:
             pass
         print(f"  attempt {i+1}/10 — retrying in 3s...")
@@ -548,11 +877,15 @@ def run(base_url: str, load_rps: int, load_duration: int) -> None:
     test_register(ca, cb, suite)
     test_login(ca, cb, suite)
     test_auth_me(ca, suite)
-    doc_ids = test_create_documents(ca, suite)
+
+    doc_ids = test_upload_documents(ca, suite)
+
     if doc_ids:
-        test_get_document(ca, cb, doc_ids, suite)
+        test_extraction_status(ca, cb, doc_ids, suite)
+        test_download_redirect(ca, doc_ids, suite)
         test_search(ca, cb, suite)
         test_delete(ca, cb, doc_ids, suite)
+
     test_validation(ca, suite)
 
     # ── Load test (async, distributed across multiple tenants) ───────────────

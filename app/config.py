@@ -34,6 +34,19 @@ class Settings(BaseSettings):
     content_max_length: int = 1_000_000   # 1 MB
     metadata_max_bytes: int = 10_000      # 10 KB
 
+    # S3 / LocalStack storage
+    s3_endpoint_url: str = "http://localhost:4566"
+    s3_bucket: str = "document-search"
+    aws_access_key_id: str = "test"
+    aws_secret_access_key: str = "test"
+    aws_region: str = "us-east-1"
+
+    # File processing limits
+    max_file_size_mb: int = 50
+    chunk_size: int = 500
+    chunk_overlap: int = 100
+    presigned_url_expiry: int = 3600  # seconds (1 hour)
+
     model_config = {"env_file": ".env"}
 
 

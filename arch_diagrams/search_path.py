@@ -1,22 +1,32 @@
 """
-Search Path Flow Diagram — GET /search
-Shows the full journey of a search query with cache hit and miss paths:
-  Client → API → Redis (cache) → Elasticsearch → Redis (cache set) → Client
+Search Path Flow Diagram — GET /search?q=...  (AWS-native)
+Step-by-step flow of a search query on AWS:
+  Client → Route53 → WAF → ALB → ECS API pod
+  → Cognito JWT decode
+  → ElastiCache rate limit
+  → ElastiCache cache lookup (HIT: return immediately | MISS: continue)
+  → Amazon OpenSearch full-text query (BM25 + tenant filter + highlight)
+  → RDS metadata + presigned S3 URL per result
+  → ElastiCache cache set (60s TTL)
+  → 200 with results + download_url
 
 Run:    python3 arch_diagrams/search_path.py
 Output: docs/search_path.png
 """
 
-import os, sys
+import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from diagrams import Cluster, Diagram, Edge
-from diagrams.elastic.elasticsearch import Elasticsearch
+from diagrams.aws.analytics import ElasticsearchService
+from diagrams.aws.compute import ECS, Fargate
+from diagrams.aws.database import ElastiCache, RDS
+from diagrams.aws.network import ELB, Route53
+from diagrams.aws.security import Cognito, WAF
+from diagrams.aws.storage import S3
 from diagrams.onprem.client import Users
-from diagrams.onprem.database import Cockroachdb
-from diagrams.onprem.inmemory import Redis
-from diagrams.onprem.network import Nginx
-from diagrams.programming.framework import FastAPI
 
 
 def generate():
@@ -26,11 +36,11 @@ def generate():
         "pad": "0.8",
         "splines": "ortho",
         "nodesep": "0.9",
-        "ranksep": "1.1",
+        "ranksep": "1.2",
     }
 
     with Diagram(
-        "Search Path — GET /search?q=...",
+        "Search Path — GET /search?q=...  (AWS)",
         filename="docs/search_path",
         outformat="png",
         show=False,
@@ -38,89 +48,131 @@ def generate():
         graph_attr=graph_attr,
     ):
 
-        client = Users("Client\nGET /search?q=...\nAuthorization: Bearer <token>")
+        client = Users(
+            "Client\nGET /search?q=...\nAuthorization: Bearer <JWT>\nX-Tenant-ID header"
+        )
 
-        with Cluster("API Tier"):
-            lb  = Nginx("Load Balancer")
-            api = FastAPI("API Pod\n(FastAPI async)")
+        # ── Edge ───────────────────────────────────────────────────────────────
+        with Cluster("Edge"):
+            dns = Route53("Route 53")
+            waf = WAF("WAF\nDDoS + SQLi filter")
 
-        with Cluster("① Tenant Validation  [sync]"):
-            crdb = Cockroachdb("CockroachDB\nJWT → tenant_id\nvalidate tenant exists")
+        # ── API Tier ───────────────────────────────────────────────────────────
+        with Cluster("API Tier  (ECS Fargate)"):
+            alb = ELB("ALB\nHTTPS :443")
+            api = Fargate("ECS API Pod\nFastAPI / uvicorn")
 
-        with Cluster("② Rate Limit Check  [sync]"):
-            redis_rl = Redis("Redis\nINCR rate:{tenant}:{window}\n429 if exceeded")
-
-        with Cluster("③ L2 Cache Lookup  [sync — < 5ms on HIT]"):
-            redis_cache = Redis(
-                "Redis\nGET search:{tenant}:{sha256(q)}\n"
-                "HIT → return immediately (cached=true)\n"
-                "MISS → continue to Elasticsearch"
+        # ── ① Auth [green] ─────────────────────────────────────────────────────
+        with Cluster("① JWT Decode + Cognito Validation  [sync — < 10ms]"):
+            cognito = Cognito(
+                "Cognito\nJWKS endpoint\nBearer JWT → tenant_id"
             )
 
-        with Cluster("④ Full-Text Search  [sync — 50–150ms on MISS]"):
-            es = Elasticsearch(
-                "Elasticsearch\n"
+        # ── ② Rate limit [orange] ──────────────────────────────────────────────
+        with Cluster("② Rate Limit Check  [sync — < 5ms]"):
+            redis_rl = ElastiCache(
+                "ElastiCache  (Redis)\nINCR rate:{tenant}:{window}\n429 if limit exceeded"
+            )
+
+        # ── ③/④ Cache lookup [red] ────────────────────────────────────────────
+        with Cluster("③/④ Cache Lookup  [sync]"):
+            redis_cache = ElastiCache(
+                "ElastiCache  (Redis)\nGET search:{tenant}:{sha256(q+page+size)}\n"
+                "HIT  →  200 OK  cached=true  |  < 5ms total\n"
+                "MISS  →  continue to OpenSearch"
+            )
+
+        # ── ⑤ OpenSearch [blue] ───────────────────────────────────────────────
+        with Cluster("⑤ Full-Text Search  [sync — 50–150ms on MISS]"):
+            opensearch = ElasticsearchService(
+                "Amazon OpenSearch\n"
                 "multi_match: title^3 + content\n"
                 "filter: tenant_id  ← mandatory\n"
                 "filter: deleted=false\n"
                 "highlight: title + content\n"
+                "collapse: doc_id (top chunk)\n"
                 "BM25 relevance ranking"
             )
 
-        with Cluster("⑤ Cache Result  [async]"):
-            redis_store = Redis(
-                "Redis\nSETEX search:{tenant}:{sha256(q)}\nTTL = 60s"
+        # ── ⑥ Metadata + presigned URL [darkgreen] ────────────────────────────
+        with Cluster("⑥ Enrich Results  [sync — per result]"):
+            rds = RDS(
+                "RDS Aurora PostgreSQL\nSELECT metadata\n(title, mime, page_count,\nword_count, status)"
+            )
+            s3 = S3(
+                "S3 Bucket\nGeneratePresignedUrl\n(1hr TTL)\ndownload_url in response"
             )
 
+        # ── ⑦ Cache set [red] ─────────────────────────────────────────────────
+        with Cluster("⑦ Cache Result  [async — fire & forget]"):
+            redis_store = ElastiCache(
+                "ElastiCache  (Redis)\nSETEX search:{tenant}:{sha256(q)}\nTTL = 60s"
+            )
+
+        # ══ Edges ═════════════════════════════════════════════════════════════
+
         # ── Main request flow ──────────────────────────────────────────────────
-        client >> Edge(color="black", label="HTTPS GET") >> lb
-        lb     >> Edge(color="black") >> api
+        client >> Edge(label="HTTPS GET /search?q=...", color="black") >> dns
+        dns >> Edge(color="black") >> waf
+        waf >> Edge(color="black") >> alb
+        alb >> Edge(color="black") >> api
 
-        # ── Step 1: Tenant validation ──────────────────────────────────────────
+        # ── ① JWT decode via Cognito ──────────────────────────────────────────
         api >> Edge(
-            color="darkgreen", style="bold",
-            label="① decode JWT\nextract tenant_id"
-        ) >> crdb
+            label="① decode Bearer JWT\nextract tenant_id\nCognito JWKS verify",
+            color="darkgreen", style="bold"
+        ) >> cognito
 
-        # ── Step 2: Rate limit ─────────────────────────────────────────────────
+        # ── ② Rate limit ──────────────────────────────────────────────────────
         api >> Edge(
-            color="orange", style="bold",
-            label="② check rate limit\n(sliding window)"
+            label="② INCR rate:{tenant}:{window}\n429 if exceeded",
+            color="orange", style="bold"
         ) >> redis_rl
 
-        # ── Step 3: Cache lookup ───────────────────────────────────────────────
+        # ── ③ Cache lookup ────────────────────────────────────────────────────
         api >> Edge(
-            color="red", style="bold",
-            label="③ cache lookup\nsha256(tenant+q+page+size)"
+            label="③ GET search:{tenant}:{sha256(q)}\ncheck cache",
+            color="red", style="bold"
         ) >> redis_cache
 
-        # ── Cache HIT path (return immediately) ───────────────────────────────
+        # ── Cache HIT → immediate return ──────────────────────────────────────
         redis_cache >> Edge(
-            color="green", style="bold",
-            label="CACHE HIT\n← 200 OK  cached=true\n< 5ms total"
+            label="CACHE HIT\n④ 200 OK  cached=true\n< 5ms total",
+            color="green", style="bold"
         ) >> api
 
-        # ── Cache MISS path → Elasticsearch ───────────────────────────────────
+        # ── Cache MISS → OpenSearch ───────────────────────────────────────────
         redis_cache >> Edge(
-            color="blue", style="dashed",
-            label="CACHE MISS\n→ query ES"
-        ) >> es
+            label="CACHE MISS\n→ query OpenSearch",
+            color="blue", style="dashed"
+        ) >> opensearch
 
-        es >> Edge(
-            color="blue", style="bold",
-            label="④ results + highlights\nscored by BM25\n50–150ms"
+        opensearch >> Edge(
+            label="⑤ ranked results\n+ highlights + scores\n50–150ms",
+            color="blue", style="bold"
         ) >> api
 
-        # ── Step 5: Store in cache ─────────────────────────────────────────────
+        # ── ⑥ Fetch metadata from RDS + presigned URL from S3 ─────────────────
         api >> Edge(
-            color="red", style="dashed",
-            label="⑤ SETEX 60s\nstore result"
+            label="⑥a fetch doc metadata\n(title, mime, page_count)",
+            color="darkgreen", style="dashed"
+        ) >> rds
+
+        api >> Edge(
+            label="⑥b GeneratePresignedUrl\n(1hr TTL  per result)",
+            color="darkgreen", style="dashed"
+        ) >> s3
+
+        # ── ⑦ Store result in cache ───────────────────────────────────────────
+        api >> Edge(
+            label="⑦ SETEX 60s\nstore full result set",
+            color="red", style="dashed"
         ) >> redis_store
 
-        # ── Final response to client ───────────────────────────────────────────
+        # ── Final response ────────────────────────────────────────────────────
         api >> Edge(
-            color="black", style="bold",
-            label="200 OK\ncached=false\ntook_ms + results"
+            label="200 OK\n{ results: [\n  { doc_id, title, snippet,\n    page_hint, score,\n    download_url (presigned S3),\n    query_time_ms } ],\n  cached: false }",
+            color="black", style="bold"
         ) >> client
 
 

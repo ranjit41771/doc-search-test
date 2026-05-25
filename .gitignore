@@ -87,3 +87,5 @@ dmypy.json
 
 # ── Ruff / linters ────────────────────────────────────────────────────────────
 .ruff_cache/
+
+frontend/node_modules/

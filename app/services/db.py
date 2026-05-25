@@ -50,18 +50,27 @@ CREATE TABLE IF NOT EXISTS tenants (
 );
 
 CREATE TABLE IF NOT EXISTS documents (
-    id          TEXT PRIMARY KEY,
-    tenant_id   TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    title       TEXT NOT NULL,
-    content     TEXT NOT NULL,
-    metadata    JSONB DEFAULT '{}',
-    deleted     BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at  TIMESTAMPTZ DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ DEFAULT NOW()
+    id                 TEXT PRIMARY KEY,
+    tenant_id          TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    title              TEXT,
+    content            TEXT,
+    metadata           JSONB DEFAULT '{}',
+    deleted            BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at         TIMESTAMPTZ DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ DEFAULT NOW(),
+    file_name          TEXT,
+    mime_type          TEXT,
+    s3_key             TEXT,
+    extraction_status  TEXT NOT NULL DEFAULT 'queued',
+    extraction_error   TEXT,
+    page_count         INT,
+    word_count         INT,
+    file_size_bytes    BIGINT NOT NULL DEFAULT 0
 );
 
-CREATE INDEX IF NOT EXISTS idx_documents_tenant     ON documents (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_documents_tenant_del ON documents (tenant_id, deleted);
+CREATE INDEX IF NOT EXISTS idx_documents_tenant           ON documents (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_documents_tenant_del       ON documents (tenant_id, deleted);
+CREATE INDEX IF NOT EXISTS idx_documents_extraction_status ON documents (extraction_status);
 """
 
 
@@ -69,6 +78,18 @@ MIGRATION_SQL = """
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS email         TEXT NOT NULL DEFAULT '';
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS password_hash TEXT NOT NULL DEFAULT '';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_email ON tenants (email);
+
+ALTER TABLE documents ALTER COLUMN title  DROP NOT NULL;
+ALTER TABLE documents ALTER COLUMN content DROP NOT NULL;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_name         TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS mime_type         TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS s3_key            TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS extraction_status TEXT NOT NULL DEFAULT 'queued';
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS extraction_error  TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS page_count        INT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS word_count        INT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_size_bytes   BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_documents_extraction_status ON documents (extraction_status);
 """
 
 
@@ -300,6 +321,114 @@ async def soft_delete_document(
     return result.split()[-1] != "0"
 
 
+# ── File document CRUD ────────────────────────────────────────────────────────
+
+async def create_file_document(
+    pool: asyncpg.Pool,
+    tenant_id: str,
+    doc_id: str,
+    file_name: str,
+    mime_type: str,
+    s3_key: str,
+    file_size_bytes: int,
+    title: str | None = None,
+) -> dict:
+    """Insert a new file document record with status=queued."""
+    now = datetime.now(timezone.utc)
+    async with TenantScope(pool, tenant_id) as scope:
+        await scope.execute(
+            """
+            INSERT INTO documents
+                (id, tenant_id, file_name, mime_type, s3_key, file_size_bytes,
+                 extraction_status, title, metadata, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 'queued', $7, '{}', $8, $9)
+            """,
+            doc_id, tenant_id, file_name, mime_type, s3_key, file_size_bytes,
+            title, now, now,
+        )
+    return {
+        "id": doc_id,
+        "tenant_id": tenant_id,
+        "file_name": file_name,
+        "mime_type": mime_type,
+        "s3_key": s3_key,
+        "file_size_bytes": file_size_bytes,
+        "extraction_status": "queued",
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+async def get_file_document(
+    pool: asyncpg.Pool,
+    tenant_id: str,
+    doc_id: str,
+) -> dict | None:
+    """Fetch a file document's full metadata."""
+    async with TenantScope(pool, tenant_id) as scope:
+        row = await scope.fetchrow(
+            """
+            SELECT id, tenant_id, file_name, mime_type, s3_key, file_size_bytes,
+                   extraction_status, extraction_error, page_count, word_count,
+                   title, metadata, created_at, updated_at, deleted
+            FROM documents
+            WHERE id = $1 AND deleted = FALSE
+            """,
+            doc_id,
+        )
+    if not row:
+        return None
+    meta = row["metadata"]
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+    return {
+        "id": row["id"],
+        "tenant_id": row["tenant_id"],
+        "file_name": row["file_name"],
+        "mime_type": row["mime_type"],
+        "s3_key": row["s3_key"],
+        "file_size_bytes": row["file_size_bytes"],
+        "extraction_status": row["extraction_status"],
+        "extraction_error": row["extraction_error"],
+        "page_count": row["page_count"],
+        "word_count": row["word_count"],
+        "title": row["title"],
+        "metadata": meta or {},
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+async def update_extraction_status(
+    pool: asyncpg.Pool,
+    doc_id: str,
+    status: str,
+    extraction_error: str | None = None,
+    page_count: int | None = None,
+    word_count: int | None = None,
+) -> None:
+    """Update extraction_status (and optional stats) without tenant scope.
+
+    This is called from the worker which does not have a tenant context.
+    It is safe because doc_id is unique and the worker only processes docs
+    it received from the queue (which were created by authenticated tenants).
+    """
+    now = datetime.now(timezone.utc)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE documents
+            SET extraction_status = $1,
+                extraction_error  = $2,
+                page_count        = COALESCE($3, page_count),
+                word_count        = COALESCE($4, word_count),
+                updated_at        = $5
+            WHERE id = $6
+            """,
+            status, extraction_error, page_count, word_count, now, doc_id,
+        )
+
+
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _row_to_response(row: asyncpg.Record) -> DocumentResponse:
@@ -309,8 +438,8 @@ def _row_to_response(row: asyncpg.Record) -> DocumentResponse:
     return DocumentResponse(
         id=row["id"],
         tenant_id=row["tenant_id"],
-        title=row["title"],
-        content=row["content"],
+        title=row["title"] or "",
+        content=row["content"] or "",
         metadata=meta or {},
         created_at=row["created_at"],
         updated_at=row["updated_at"],
